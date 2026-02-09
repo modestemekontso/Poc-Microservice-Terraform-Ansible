@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: poc-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - poc_pg_data:/var/lib/postgresql/data
+
+volumes:
+  poc_pg_data:
