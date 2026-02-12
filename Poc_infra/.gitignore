@@ -1,0 +1,19 @@
+**/.terraform/*
+**/.vscode/*
+*.tfstate
+*.tfstate.*
+.env
+
+# Docker
+.env
+*.env
+!.env.example
+
+# Database backups
+backups/
+
+# Docker volumes
+**/data/
+
+# VS Code
+.vscode/
