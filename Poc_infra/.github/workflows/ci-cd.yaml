@@ -9,7 +9,7 @@ on:
 jobs:
   build-and-test:
     name: Build and Test - ${{ matrix.service }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         service: [CustomerService, OrderService, CatalogService]
@@ -33,7 +33,7 @@ jobs:
 
   build-docker-images:
     name: Build Docker Image - ${{ matrix.service }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: build-and-test
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     strategy:
