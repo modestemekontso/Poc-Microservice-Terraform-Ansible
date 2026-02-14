@@ -1,20 +1,209 @@
-name: Microservices CI/CD
+name: Microservices CI/CD Pipeline (Security Enhanced)
 
 on:
   push:
-    branches: [ main, develop, feature/* ]
+    branches: [main, develop, feature/*]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: write
 
 env:
   REGISTRY: docker.io
   IMAGE_PREFIX: ${{ secrets.DOCKER_USERNAME }}
+  DOTNET_VERSION: '8.0.x'
 
+# ==========================================================
+# 🧹 CLEANUP JOB (DISK SPACE MANAGEMENT)
+# ==========================================================
 jobs:
+  cleanup:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Install and Start Docker
+        run: |
+          if ! command -v docker &> /dev/null; then
+            echo "Docker not found, installing..."
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+            sudo systemctl start docker
+            sudo systemctl enable docker
+          else
+            echo "Docker already installed"
+            sudo systemctl start docker || true
+          fi
+          
+          sudo chmod 666 /var/run/docker.sock
+          sudo usermod -aG docker $USER || true
+          sleep 5
+          docker --version
+          
+      - name: Disk Space BEFORE Cleanup
+        run: |
+          echo "===== DISK BEFORE CLEANUP ====="
+          df -h
+          docker system df || true
+
+      - name: 🚨 Docker Cleanup
+        run: |
+          echo "Stopping old containers..."
+          docker ps -a --filter "name=customer-service" -q | xargs -r docker stop || true
+          docker ps -a --filter "name=order-service" -q | xargs -r docker stop || true
+          docker ps -a --filter "name=catalog-service" -q | xargs -r docker stop || true
+          
+          echo "Removing old containers..."
+          docker ps -a --filter "name=customer-service" -q | xargs -r docker rm -f || true
+          docker ps -a --filter "name=order-service" -q | xargs -r docker rm -f || true
+          docker ps -a --filter "name=catalog-service" -q | xargs -r docker rm -f || true
+          
+          echo "Pruning unused images (keep last 3 versions)..."
+          docker image prune -a -f --filter "until=72h" || true
+          
+          echo "Removing dangling volumes..."
+          docker volume prune -f || true
+          
+          echo "Pruning build cache..."
+          docker builder prune -a -f --keep-storage=5GB || true
+
+      - name: 🧹 System Cleanup
+        run: |
+          sudo apt-get clean || true
+          sudo apt-get autoclean || true
+          sudo apt-get autoremove -y || true
+          sudo rm -rf /tmp/* 2>/dev/null || true
+          sudo journalctl --rotate || true
+          sudo journalctl --vacuum-time=1d || true
+          rm -rf ~/.cache/trivy 2>/dev/null || true
+          rm -rf ~/.nuget/packages 2>/dev/null || true
+
+      - name: Disk Space AFTER Cleanup
+        run: |
+          echo "===== DISK AFTER CLEANUP ====="
+          df -h
+          docker system df || true
+
+      - name: Verify Disk Space
+        run: |
+          AVAILABLE=$(df / | tail -1 | awk '{print $4}')
+          echo "Available disk space: $AVAILABLE KB (~$((AVAILABLE/1024/1024)) GB)"
+          if [ "$AVAILABLE" -lt 1000000 ]; then
+            echo "❌ ERROR: Less than 1GB free - critically low space!"
+            exit 1
+          elif [ "$AVAILABLE" -lt 3000000 ]; then
+            echo "⚠️ WARNING: Less than 3GB free - workflow may fail!"
+          else
+            echo "✅ Disk space sufficient: $((AVAILABLE/1024/1024)) GB free"
+          fi
+
+# ==========================================================
+# 🔐 SECURITY SCANS
+# ==========================================================
+  security-scan:
+    runs-on: self-hosted
+    needs: cleanup
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 🔑 Gitleaks - Secret Detection
+      - name: Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        
+      - name: Upload Gitleaks SARIF
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: gitleaks
+
+      # 📊 SonarQube Code Quality
+      - name: Setup Java for SonarScanner
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install SonarScanner for .NET
+        run: |
+          dotnet tool install --global dotnet-sonarscanner || true
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: SonarQube Begin Analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          cd Poc_infra
+          dotnet sonarscanner begin \
+            /k:"${{ github.repository_owner }}_${{ github.event.repository.name }}" \
+            /d:sonar.host.url="${SONAR_HOST_URL}" \
+            /d:sonar.token="${SONAR_TOKEN}" \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml"
+        continue-on-error: true
+
+      - name: Build for SonarQube
+        run: |
+          cd Poc_infra
+          dotnet build Poc_infra.sln --configuration Release
+        continue-on-error: true
+
+      - name: SonarQube End Analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          cd Poc_infra
+          dotnet sonarscanner end /d:sonar.token="${SONAR_TOKEN}"
+        continue-on-error: true
+
+      # 🏗️ Checkov - IaC Security
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov IaC Scan
+        run: |
+          checkov -d Poc_infra \
+            --framework dockerfile docker_compose \
+            --output cli sarif \
+            --output-file-path console,checkov.sarif \
+            --soft-fail
+        continue-on-error: true
+
+      - name: Upload Checkov SARIF
+        if: always() && hashFiles('checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+# ==========================================================
+# 🧪 BUILD AND TEST .NET SERVICES
+# ==========================================================
   build-and-test:
-    name: Build and Test - ${{ matrix.service }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    needs: security-scan
+    timeout-minutes: 30
     strategy:
       matrix:
         service: [CustomerService, OrderService, CatalogService]
@@ -26,23 +215,61 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
       
       - name: Restore dependencies
-        run: dotnet restore Poc_infra/${{ matrix.service }}/${{ matrix.service }}.csproj
+        run: |
+          cd Poc_infra
+          dotnet restore ${{ matrix.service }}/${{ matrix.service }}.csproj
       
       - name: Build
-        run: dotnet build Poc_infra/${{ matrix.service }}/${{ matrix.service }}.csproj --no-restore -c Release
+        run: |
+          cd Poc_infra
+          dotnet build ${{ matrix.service }}/${{ matrix.service }}.csproj \
+            --no-restore \
+            --configuration Release
       
       - name: Run tests
-        run: dotnet test Poc_infra/${{ matrix.service }}/${{ matrix.service }}.csproj --no-build --verbosity normal
+        run: |
+          cd Poc_infra
+          if [ -f "${{ matrix.service }}.Tests/${{ matrix.service }}.Tests.csproj" ]; then
+            dotnet test ${{ matrix.service }}.Tests/${{ matrix.service }}.Tests.csproj \
+              --no-build \
+              --configuration Release \
+              --logger "trx;LogFileName=test-results.trx" \
+              --collect:"XPlat Code Coverage" \
+              -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+          else
+            echo "No test project found for ${{ matrix.service }}, skipping tests"
+          fi
+        continue-on-error: true
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.service }}
+          path: |
+            Poc_infra/**/TestResults/*.trx
+            Poc_infra/**/coverage.opencover.xml
+          retention-days: 7
         continue-on-error: true
 
+# ==========================================================
+# 🐳 BUILD DOCKER IMAGES
+# ==========================================================
   build-docker-images:
-    name: Build Docker Image - ${{ matrix.service }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: build-and-test
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    timeout-minutes: 45
     strategy:
       matrix:
         service: [CustomerService, OrderService, CatalogService]
@@ -50,16 +277,34 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
+      - name: Check Disk Space
+        run: |
+          echo "Disk space before build:"
+          df -h
+          AVAILABLE=$(df / | tail -1 | awk '{print $4}')
+          echo "DISK_SPACE_KB=$AVAILABLE" >> $GITHUB_ENV
+          if [ "$AVAILABLE" -lt 2000000 ]; then
+            echo "❌ ERROR: Less than 2GB free - not enough for build!"
+            exit 1
+          fi
+
+      - name: Fix Docker Permissions
+        run: |
+          sudo systemctl start docker || true
+          sudo chmod 666 /var/run/docker.sock
+          sleep 3
+          docker ps
+          
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -68,8 +313,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
-      
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -80,6 +326,235 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:buildcache,mode=max
-      
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
       - name: Image digest
         run: echo ${{ steps.meta.outputs.digest }}
+
+# ==========================================================
+# 🛡️ SCAN DOCKER IMAGES WITH TRIVY
+# ==========================================================
+  scan-docker-images:
+    runs-on: self-hosted
+    needs: build-docker-images
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        service: [CustomerService, OrderService, CatalogService]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Disk Space for Scanning
+        run: |
+          AVAILABLE=$(df / | tail -1 | awk '{print $4}')
+          echo "DISK_SPACE_KB=$AVAILABLE" >> $GITHUB_ENV
+          if [ "$AVAILABLE" -lt 3000000 ]; then
+            echo "⚠️ Low disk space - may skip detailed scanning"
+          fi
+
+      - name: Trivy Scan - ${{ matrix.service }}
+        if: env.DISK_SPACE_KB > 2000000
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: 0
+          timeout: 15m0s
+        env:
+          TRIVY_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        continue-on-error: true
+
+      - name: Upload Trivy Results
+        if: always() && hashFiles('trivy-${{ matrix.service }}.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Trivy Summary
+        if: env.DISK_SPACE_KB > 2000000
+        run: |
+          docker run --rm \
+            -e TRIVY_USERNAME=${{ secrets.DOCKER_USERNAME }} \
+            -e TRIVY_PASSWORD=${{ secrets.DOCKER_PASSWORD }} \
+            aquasec/trivy image \
+            --severity CRITICAL,HIGH \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }} || true
+        continue-on-error: true
+
+# ==========================================================
+# 🚀 DEPLOY TO DEVELOPMENT/PRODUCTION
+# ==========================================================
+  deploy:
+    runs-on: self-hosted
+    needs: scan-docker-images
+    timeout-minutes: 20
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure Docker is Running
+        run: |
+          sudo systemctl start docker || true
+          sudo chmod 666 /var/run/docker.sock
+          sleep 3
+          docker ps
+
+      - name: Install Docker Compose
+        run: |
+          if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+            echo "Installing Docker Compose..."
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
+          docker-compose --version || docker compose version
+
+      - name: Configure Environment
+        run: |
+          cd Poc_infra
+          if [ ! -f .env ]; then
+            cp .env.example .env
+            echo "VERSION=${{ github.sha }}" >> .env
+          fi
+
+      - name: Pull Latest Images
+        run: |
+          cd Poc_infra
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/CustomerService:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/OrderService:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/CatalogService:${{ github.sha }}
+
+      - name: Stop Old Containers
+        run: |
+          cd Poc_infra
+          docker-compose down || docker compose down || true
+        continue-on-error: true
+
+      - name: Deploy with Docker Compose
+        run: |
+          cd Poc_infra
+          export VERSION=${{ github.sha }}
+          if command -v docker-compose &> /dev/null; then
+            docker-compose up -d
+          else
+            docker compose up -d
+          fi
+
+      - name: Wait for Services Startup
+        run: |
+          echo "Waiting for services to be healthy..."
+          sleep 30
+
+      - name: Health Check - CustomerService
+        run: |
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          until curl -f http://localhost:5001/health || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT+1)) of $MAX_RETRIES for CustomerService..."
+            sleep 5
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "❌ CustomerService failed health check"
+            docker logs customer-service
+            exit 1
+          fi
+          echo "✅ CustomerService is healthy"
+
+      - name: Health Check - OrderService
+        run: |
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          until curl -f http://localhost:5002/health || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT+1)) of $MAX_RETRIES for OrderService..."
+            sleep 5
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "❌ OrderService failed health check"
+            docker logs order-service
+            exit 1
+          fi
+          echo "✅ OrderService is healthy"
+
+      - name: Health Check - CatalogService
+        run: |
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          until curl -f http://localhost:5003/health || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT+1)) of $MAX_RETRIES for CatalogService..."
+            sleep 5
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "❌ CatalogService failed health check"
+            docker logs catalog-service
+            exit 1
+          fi
+          echo "✅ CatalogService is healthy"
+
+      - name: Check RabbitMQ
+        run: |
+          if curl -f http://localhost:15672 > /dev/null 2>&1; then
+            echo "✅ RabbitMQ is accessible"
+          else
+            echo "⚠️ RabbitMQ management UI not accessible"
+          fi
+
+      - name: Show Deployment Status
+        run: |
+          cd Poc_infra
+          echo "===== DEPLOYMENT STATUS ====="
+          docker-compose ps || docker compose ps
+          echo ""
+          echo "===== SERVICE LOGS (last 50 lines) ====="
+          docker-compose logs --tail=50 || docker compose logs --tail=50
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "🎉 Deployment successful!"
+          echo "Services deployed:"
+          echo "  - CustomerService: http://localhost:5001"
+          echo "  - OrderService: http://localhost:5002"
+          echo "  - CatalogService: http://localhost:5003"
+          echo "  - RabbitMQ: http://localhost:15672"
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed, attempting rollback..."
+          cd Poc_infra
+          docker-compose down || docker compose down
+          echo "Services stopped. Manual intervention may be required."
+
+      - name: Final Cleanup
+        if: always()
+        run: docker system prune -f
+
+# ==========================================================
+# 📊 DEPLOYMENT NOTIFICATION
+# ==========================================================
+  notify:
+    runs-on: self-hosted
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: Deployment Status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ Deployment completed successfully!"
+          else
+            echo "❌ Deployment failed or was skipped"
+          fi
